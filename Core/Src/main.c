@@ -37,8 +37,8 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define AC_THRESHOLD_HIGH 3745
-#define AC_THRESHOLD_LOW 3735
+#define AC_THRESHOLD_HIGH 3690
+#define AC_THRESHOLD_LOW 3680
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -76,6 +76,7 @@ int main(void)
 	int heater_on = 0;
 	uint32_t time = 0;
 	uint32_t prev_time = 0;
+	uint32_t iter = 0;
 
   /* USER CODE END 1 */
 
@@ -111,6 +112,7 @@ int main(void)
   while (1)
   {
 	  prev_time = time;
+	  iter++;
 	  HAL_Delay(500);
 
 	  // get time
@@ -130,12 +132,13 @@ int main(void)
 
 	  // compute derivative
 	  float tempd = (float)(raw_temp - prev_temp)/(float)(time - prev_time);
-	  if (tempd > 0.01) {
-		  sprintf((char*)msg, "INFO: temp is rising quickly at %d/100 raw units/ms\n", (int)(tempd*100));
+	  if (abs(tempd) > 0.01) {
+		  sprintf((char*)msg, "INFO: temp is rising/falling quickly at %d/100 raw units/ms\n", (int)(tempd*100));
 		  HAL_UART_Transmit(&huart2, msg, strnlen((const char*)msg, sizeof(msg)), 100);
 	  }
 
-//	  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+
+	prev_temp = raw_temp;
 
 	  // read temp value
 	HAL_ADC_Start(&hadc);
@@ -149,17 +152,24 @@ int main(void)
 		heater_on = 0;
 	}
 
+	// control heater based on iterations
+//	heater_on = iter & 0x40 ? 1 : 0;
+
 	if (heater_on) {
+		// heater pin is flipped (RESET enables the heating resistor)
+		HAL_GPIO_WritePin(heater_GPIO_Port, heater_Pin, GPIO_PIN_RESET);
+		// led
 		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
 	} else {
+		HAL_GPIO_WritePin(heater_GPIO_Port, heater_Pin, GPIO_PIN_SET);
+		// led
 		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 	}
 
-	sprintf((char*)msg, "INFO: adc reading: %d, heater status: %d, (low: %d, high: %d), tempd: %d/1000\r\n",
-			raw_temp, heater_on, AC_THRESHOLD_LOW, AC_THRESHOLD_HIGH, (int)(tempd*1000));
+	sprintf((char*)msg, "INFO: iter: %5lu, adc reading: %d, heater status: %d, (low: %d, high: %d), tempd: %3d/1000, dtime: %4lu\r\n",
+			iter, raw_temp, heater_on, AC_THRESHOLD_LOW, AC_THRESHOLD_HIGH, (int)(tempd*1000), time - prev_time);
 	HAL_UART_Transmit(&huart2, msg, strnlen((const char*)msg, sizeof(msg)), 100);
 
-	prev_temp = raw_temp;
 
     /* USER CODE END WHILE */
 
@@ -314,7 +324,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LD2_Pin|GPIO_PIN_8, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LD2_Pin|heater_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -322,8 +332,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LD2_Pin PA8 */
-  GPIO_InitStruct.Pin = LD2_Pin|GPIO_PIN_8;
+  /*Configure GPIO pins : LD2_Pin heater_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin|heater_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
