@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -132,7 +133,7 @@ int main(void)
 
 	  // compute derivative
 	  float tempd = (float)(raw_temp - prev_temp)/(float)(time - prev_time);
-	  if (abs(tempd) > 0.01) {
+	  if (fabs(tempd) > 0.01) {
 		  sprintf((char*)msg, "INFO: temp is rising/falling quickly at %d/100 raw units/ms\n", (int)(tempd*100));
 		  HAL_UART_Transmit(&huart2, msg, strnlen((const char*)msg, sizeof(msg)), 100);
 	  }
