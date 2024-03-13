@@ -1,20 +1,20 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2024 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2024 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -45,6 +45,8 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc;
 
+TIM_HandleTypeDef htim1;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -56,12 +58,77 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// 0: testing calibration
+// 1: PID temp control
+int mode;
+
+#define _UART_BUF_SIZE 256
+char _uart_buf[_UART_BUF_SIZE];
+
+#define UART_PRINTF(...) \
+	do { \
+		snprintf(_uart_buf, sizeof(_uart_buf), __VA_ARGS__); \
+		HAL_UART_Transmit(&huart2, (uint8_t*)_uart_buf, strnlen((const char*)_uart_buf, sizeof(_uart_buf)), 100); \
+	} while (0)
+
+uint16_t read_temp_raw() {
+	HAL_ADC_Start(&hadc);
+	HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
+	return HAL_ADC_GetValue(&hadc);
+}
+
+void set_heater_val(uint16_t value) {
+	/*
+	 * Note:
+	 * value = 0: heater on 100%
+	 * value = 65535 (max): heater off 0%
+	 *
+	 * This is because heater is connected active low
+	 */
+	TIM1->CCR1 = value;
+}
+
+#define CALIBRATE_SAMPLE_N 64
+#define CALIBRATE_TICK_DELAY 10
+
+/**
+ * For calibrating raw temperature readings to real temperature.
+ */
+void calibrate_temperature() {
+	int tick = 1;
+	uint16_t raw = 0;
+	uint32_t samples = 0;
+
+	// ensure that we are in calibration mode
+	mode = 0;
+
+	// disable heater
+	set_heater_val(0xffff);
+
+	while (1) {
+		raw = read_temp_raw();
+		samples += raw;
+
+		if (tick % CALIBRATE_SAMPLE_N == 0) {
+			uint32_t reading_raw = samples*1000/CALIBRATE_SAMPLE_N;
+			uint16_t reading_l = (uint16_t)(reading_raw/1000);
+			uint16_t reading_r = (uint16_t)(reading_raw%1000);
+			UART_PRINTF("Tick: %5d, raw reading averaged over %d samples every %d ms: %4d.%03d\n\r", tick, CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY, reading_l, reading_r);
+			samples = 0;
+		}
+
+		HAL_Delay(CALIBRATE_TICK_DELAY);
+		tick++;
+	}
+}
 
 /* USER CODE END 0 */
 
@@ -72,12 +139,7 @@ static void MX_ADC_Init(void);
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-	uint8_t msg[200];
-	uint16_t raw_temp, prev_temp;
-	int heater_on = 0;
-	uint32_t time = 0;
-	uint32_t prev_time = 0;
-	uint32_t iter = 0;
+	mode = 0;
 
   /* USER CODE END 1 */
 
@@ -101,81 +163,42 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_ADC_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+	UART_PRINTF("Boot.\n\r");
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  time = HAL_GetTick();
+		calibrate_temperature();
 
-  while (1)
-  {
-	  prev_time = time;
-	  iter++;
-	  HAL_Delay(500);
+	int tick = 0;
+	uint16_t heater_val = 0;
 
-	  // get time
-	  time = HAL_GetTick();
-	  if (time < prev_time) {
-		  // something bad happened!
-		  return 1;
-	  }
-	  if (time < prev_time + 10) {
-		  // need at least 10ms between each iteration
-		  continue;
-	  }
-	  if (time > prev_time + 1000) {
-		  // discard if iterations took too long
-		  continue;
-	  }
+	while (1) {
+		uint16_t raw;
 
-	  // compute derivative
-	  float tempd = (float)(raw_temp - prev_temp)/(float)(time - prev_time);
-	  if (fabs(tempd) > 0.01) {
-		  sprintf((char*)msg, "INFO: temp is rising/falling quickly at %d/100 raw units/ms\n", (int)(tempd*100));
-		  HAL_UART_Transmit(&huart2, msg, strnlen((const char*)msg, sizeof(msg)), 100);
-	  }
+		raw = read_temp_raw();
+		set_heater_val(heater_val);
 
+		heater_val = 0xffff;
 
-	prev_temp = raw_temp;
-
-	  // read temp value
-	HAL_ADC_Start(&hadc);
-	HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
-	raw_temp = HAL_ADC_GetValue(&hadc);
-
-	// check if temp is low
-	if (raw_temp < AC_THRESHOLD_LOW) {
-		heater_on = 1;
-	} else if (raw_temp > AC_THRESHOLD_HIGH) {
-		heater_on = 0;
-	}
-
-	// control heater based on iterations
-//	heater_on = iter & 0x40 ? 1 : 0;
-
-	if (heater_on) {
-		// heater pin is flipped (RESET enables the heating resistor)
-		HAL_GPIO_WritePin(heater_GPIO_Port, heater_Pin, GPIO_PIN_RESET);
-		// led
-		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-	} else {
-		HAL_GPIO_WritePin(heater_GPIO_Port, heater_Pin, GPIO_PIN_SET);
-		// led
-		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-	}
-
-	sprintf((char*)msg, "INFO: iter: %5lu, adc reading: %d, heater status: %d, (low: %d, high: %d), tempd: %3d/1000, dtime: %4lu\r\n",
-			iter, raw_temp, heater_on, AC_THRESHOLD_LOW, AC_THRESHOLD_HIGH, (int)(tempd*1000), time - prev_time);
-	HAL_UART_Transmit(&huart2, msg, strnlen((const char*)msg, sizeof(msg)), 100);
-
-
+		if (tick % 32 == 0) {
+			// print header for CSV
+			UART_PRINTF("HDR,%4s, %4s, %5s\n\r", "tick", "raw", "htr");
+		}
+		// print in CSV format
+		UART_PRINTF("DAT,%4d, %4d, %5d\n\r", tick, raw, heater_val);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+		HAL_Delay(500);
+		tick++;
+	}
   /* USER CODE END 3 */
 }
 
@@ -274,6 +297,81 @@ static void MX_ADC_Init(void)
 }
 
 /**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 65535;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
   * @brief USART2 Initialization Function
   * @param None
   * @retval None
@@ -325,7 +423,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LD2_Pin|heater_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -333,12 +431,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LD2_Pin heater_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin|heater_Pin;
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
@@ -355,11 +453,10 @@ static void MX_GPIO_Init(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
+	}
   /* USER CODE END Error_Handler_Debug */
 }
 
