@@ -100,6 +100,7 @@ float temp_history[HIST_SIZE];
 float output_history[HIST_SIZE];
 int current_history = 0;
 
+int button_on = 0;
 uint8_t button_debounce = 0;
 /* USER CODE END PV */
 
@@ -241,21 +242,6 @@ void button_released() {
     PID_new_sp(83.0);
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM16) {
-    // interrupts every 10ms
-    PID_update();
-
-    // button debouncing
-    int pressed = HAL_GPIO_ReadPin(blue_btn_GPIO_Port, blue_btn_Pin) == GPIO_PIN_RESET;
-    button_debounce = (button_debounce << 1) | (pressed & 1);
-    if (button_debounce == 0xf0) {
-      // button release (falling edge)
-      button_released();
-    }
-  }
-}
-
 /**
  * Creates new row of temperature (and control) graph
  */
@@ -295,6 +281,34 @@ void graph_temp() {
   UART_PRINTF(", sp: ");
   UART_PRINT_FLOAT(pidctl.sp);
   UART_PRINTF(", raw: %4d, time: %3d sec\n", read_temp_raw(), seconds);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  static uint8_t ctr = 0;
+
+  if (htim->Instance == TIM16) {
+    // interrupts every 10ms
+    PID_update();
+
+    // button debouncing
+    int pressed = HAL_GPIO_ReadPin(blue_btn_GPIO_Port, blue_btn_Pin) == GPIO_PIN_RESET;
+    button_debounce = (button_debounce << 1) | (pressed & 1);
+    if (button_debounce == 0xff) {
+      button_on = 1;
+    } else if (button_debounce == 0x00) {
+      if (button_on) {
+        // button release (falling edge)
+        button_released();
+      }
+      button_on = 0;
+    }
+
+    ctr++;
+    // debug graph
+    if (ctr % 50 == 0) {
+      graph_temp();
+    }
+  }
 }
 
 /* USER CODE END 0 */
@@ -359,12 +373,9 @@ int main(void)
   PID_new_sp(85.0);
 
   while (1) {
-    graph_temp();
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_Delay(500);
   }
   /* USER CODE END 3 */
 }
