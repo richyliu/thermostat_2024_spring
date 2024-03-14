@@ -38,14 +38,14 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define AC_THRESHOLD_HIGH 3690
-#define AC_THRESHOLD_LOW 3680
+
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart2;
 
@@ -59,6 +59,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -70,6 +71,14 @@ static void MX_TIM1_Init(void);
 // 1: PID temp control
 int mode;
 
+// value the heater was set to
+int heater_set_val;
+
+// when the heater is on (pwm set to 0), the ADC reading is on average different by this much than what it should be
+#define HEATER_ADC_DIFF -14.6
+#define RAW_TO_TEMP_A 0.123
+#define RAW_TO_TEMP_B -365.9
+
 #define _UART_BUF_SIZE 256
 char _uart_buf[_UART_BUF_SIZE];
 
@@ -79,54 +88,120 @@ char _uart_buf[_UART_BUF_SIZE];
 		HAL_UART_Transmit(&huart2, (uint8_t*)_uart_buf, strnlen((const char*)_uart_buf, sizeof(_uart_buf)), 100); \
 	} while (0)
 
+#define UART_PRINT_FLOAT(val) UART_PRINTF("%lu.%02lu", (uint32_t)(val), (uint32_t)((val)*100.0)%100)
+
 uint16_t read_temp_raw() {
 	HAL_ADC_Start(&hadc);
 	HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
 	return HAL_ADC_GetValue(&hadc);
 }
 
-void set_heater_val(uint16_t value) {
+/**
+ * Set heater with 0.0 being off and 1.0 being on (full)
+ */
+void set_heater(float value) {
 	/*
 	 * Note:
-	 * value = 0: heater on 100%
-	 * value = 65535 (max): heater off 0%
+	 * raw value = 0: heater on 100%
+	 * raw value = 65535 (max): heater off 0%
 	 *
 	 * This is because heater is connected active low
 	 */
-	TIM1->CCR1 = value;
+	heater_set_val = value;
+	TIM1->CCR1 = fabs(1.0 - value)*0xffff;
 }
 
-#define CALIBRATE_SAMPLE_N 64
+#define CALIBRATE_SAMPLE_N 256
 #define CALIBRATE_TICK_DELAY 10
+
+/**
+ * Sum multiple samples of ADC data spaced evenly by a delay
+ */
+float read_samples(int size, uint32_t tick_delay) {
+	uint32_t total = 0;
+	for (int i = 0; i < size; i++) {
+		total += read_temp_raw();
+		HAL_Delay(tick_delay);
+	}
+	return total*1.0/size;
+}
+
+/**
+ * Convert raw ADC readings to temperature (Celcius)
+ * Correct for lower readings when heater is on
+ */
+#define RAW_TO_TEMP(raw) ((RAW_TO_TEMP_A*((raw) - heater_set_val*HEATER_ADC_DIFF) + RAW_TO_TEMP_B))
 
 /**
  * For calibrating raw temperature readings to real temperature.
  */
 void calibrate_temperature() {
-	int tick = 1;
-	uint16_t raw = 0;
-	uint32_t samples = 0;
+	// ensure that we are in calibration mode
+	mode = 0;
+
+	// disable heater
+	set_heater(0);
+	UART_PRINTF("%d\n", sizeof(int));
+
+	while (1) {
+		float reading = read_samples(CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY);
+
+		UART_PRINTF("Raw reading averaged over %d samples every %d ms: ", CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY);
+		UART_PRINT_FLOAT(reading);
+		UART_PRINTF("\n\r");
+
+		HAL_Delay(500);
+	}
+}
+
+/**
+ * For calibrating how much the ADC readings are affected by different heater settings.
+ *
+ * Nice way to analyze these values on command line (for average and stddev):
+ * cut -d' ' -f 6,9 | sort | awk -F' ' '{vals[$1]+=$2;vsq[$1]+=($2)^2;c[$1]+=1;} END{for (v in vals) print v, vals[v]/c[v], sqrt((vsq[v]-vals[v]^2/c[v])/c[v]);}'
+ */
+void calibrate_voltage_drop() {
+	float heatval = 0;
 
 	// ensure that we are in calibration mode
 	mode = 0;
 
 	// disable heater
-	set_heater_val(0xffff);
+	set_heater(0);
 
 	while (1) {
-		raw = read_temp_raw();
-		samples += raw;
+		// calculate baseline
+		set_heater(0);
+		float baseline = read_samples(256, 10);
 
-		if (tick % CALIBRATE_SAMPLE_N == 0) {
-			uint32_t reading_raw = samples*1000/CALIBRATE_SAMPLE_N;
-			uint16_t reading_l = (uint16_t)(reading_raw/1000);
-			uint16_t reading_r = (uint16_t)(reading_raw%1000);
-			UART_PRINTF("Tick: %5d, raw reading averaged over %d samples every %d ms: %4d.%03d\n\r", tick, CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY, reading_l, reading_r);
-			samples = 0;
-		}
+		// measure spike with heater
+		set_heater(heatval);
+		float with_heater = read_samples(16, 2);
+		set_heater(0);
 
-		HAL_Delay(CALIBRATE_TICK_DELAY);
-		tick++;
+		UART_PRINTF("baseline: ");
+		UART_PRINT_FLOAT(baseline);
+		UART_PRINTF(", with heater at ");
+		UART_PRINT_FLOAT(heatval);
+		UART_PRINTF(": ");
+		UART_PRINT_FLOAT(with_heater);
+		UART_PRINTF(", delta: ");
+		UART_PRINT_FLOAT(baseline - with_heater);
+		UART_PRINTF("\n\r");
+
+		heatval += 0.25;
+		if (heatval > 1.0) heatval = 0;
+
+		HAL_Delay(500);
+	}
+}
+
+static int global_counter = 0;
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	if (htim->Instance == TIM16) {
+		// used for PID, interrupts every 10ms
+		global_counter++;
 	}
 }
 
@@ -140,6 +215,7 @@ int main(void)
 {
   /* USER CODE BEGIN 1 */
 	mode = 0;
+	set_heater(0);
 
   /* USER CODE END 1 */
 
@@ -164,9 +240,12 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC_Init();
   MX_TIM1_Init();
+  MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
 
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+	// start in interrupt mode to drive PID control
+	HAL_TIM_Base_Start_IT(&htim16);
 	UART_PRINTF("Boot.\n\r");
 
   /* USER CODE END 2 */
@@ -174,30 +253,16 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-		calibrate_temperature();
-
-	int tick = 0;
-	uint16_t heater_val = 0;
+	// select function to run
+//	calibrate_temperature();
+//	calibrate_voltage_drop();
 
 	while (1) {
-		uint16_t raw;
-
-		raw = read_temp_raw();
-		set_heater_val(heater_val);
-
-		heater_val = 0xffff;
-
-		if (tick % 32 == 0) {
-			// print header for CSV
-			UART_PRINTF("HDR,%4s, %4s, %5s\n\r", "tick", "raw", "htr");
-		}
-		// print in CSV format
-		UART_PRINTF("DAT,%4d, %4d, %5d\n\r", tick, raw, heater_val);
+		UART_PRINTF("Ctr: %7d\n\r", global_counter);
+		HAL_Delay(1000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-		HAL_Delay(500);
-		tick++;
 	}
   /* USER CODE END 3 */
 }
@@ -368,6 +433,38 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 48-1;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 10000-1;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
 
 }
 
