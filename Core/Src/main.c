@@ -24,21 +24,52 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include "pid.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+  PID_TypeDef TPID;
+  double input;
+  double output;
+  double sp; // set point
+} PID_control;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+// when the heater is on (pwm set to 0), the ADC reading is on average different by this much than what it should be
+#define HEATER_ADC_DIFF -14.6
+#define RAW_TO_TEMP_A 0.123
+#define RAW_TO_TEMP_B -365.9
 
+#define _UART_BUF_SIZE 256
+#define HIST_SIZE 64
+
+// settings for debug graph
+#define GRAPH_N_CHARS 64
+#define GRAPH_TEMP_MIN 68.0
+#define GRAPH_TEMP_RANGE 10.0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define UART_PRINTF(...) \
+    do { \
+        snprintf(_uart_buf, sizeof(_uart_buf), __VA_ARGS__); \
+        HAL_UART_Transmit(&huart2, (uint8_t*)_uart_buf, strnlen((const char*)_uart_buf, sizeof(_uart_buf)), 100); \
+    } while (0)
 
+#define UART_PRINT_FLOAT(val) UART_PRINTF("%lu.%02lu", (uint32_t)(val), (uint32_t)((val)*100.0)%100)
+
+/**
+ * Convert raw ADC readings to temperature (Fahrenheit)
+ * Corrects for lower readings when heater is on
+ */
+#define RAW_TO_TEMP(raw) ((RAW_TO_TEMP_A*((raw) - heater_set_val*HEATER_ADC_DIFF) + RAW_TO_TEMP_B))
+
+#define CLAMP(v, min, max) ((v) < (min) ? (min) : (v) > (max) ? (max) : (v))
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -50,7 +81,16 @@ TIM_HandleTypeDef htim16;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+char _uart_buf[_UART_BUF_SIZE];
 
+// value the heater was set to
+float heater_set_val;
+
+PID_control pidctl;
+
+float temp_history[HIST_SIZE];
+float output_history[HIST_SIZE];
+int current_history = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,91 +107,59 @@ static void MX_TIM16_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// 0: testing calibration
-// 1: PID temp control
-int mode;
-
-// value the heater was set to
-int heater_set_val;
-
-// when the heater is on (pwm set to 0), the ADC reading is on average different by this much than what it should be
-#define HEATER_ADC_DIFF -14.6
-#define RAW_TO_TEMP_A 0.123
-#define RAW_TO_TEMP_B -365.9
-
-#define _UART_BUF_SIZE 256
-char _uart_buf[_UART_BUF_SIZE];
-
-#define UART_PRINTF(...) \
-	do { \
-		snprintf(_uart_buf, sizeof(_uart_buf), __VA_ARGS__); \
-		HAL_UART_Transmit(&huart2, (uint8_t*)_uart_buf, strnlen((const char*)_uart_buf, sizeof(_uart_buf)), 100); \
-	} while (0)
-
-#define UART_PRINT_FLOAT(val) UART_PRINTF("%lu.%02lu", (uint32_t)(val), (uint32_t)((val)*100.0)%100)
 
 uint16_t read_temp_raw() {
-	HAL_ADC_Start(&hadc);
-	HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
-	return HAL_ADC_GetValue(&hadc);
+  HAL_ADC_Start(&hadc);
+  HAL_ADC_PollForConversion(&hadc, HAL_MAX_DELAY);
+  return HAL_ADC_GetValue(&hadc);
 }
 
 /**
  * Set heater with 0.0 being off and 1.0 being on (full)
  */
 void set_heater(float value) {
-	/*
-	 * Note:
-	 * raw value = 0: heater on 100%
-	 * raw value = 65535 (max): heater off 0%
-	 *
-	 * This is because heater is connected active low
-	 */
-	heater_set_val = value;
-	TIM1->CCR1 = fabs(1.0 - value)*0xffff;
+  /*
+   * Note:
+   * raw value = 0: heater on 100%
+   * raw value = 65535 (max): heater off 0%
+   *
+   * This is because heater is connected active low
+   */
+  heater_set_val = value;
+  TIM1->CCR1 = fabs(1.0 - value) * 0xffff;
 }
-
-#define CALIBRATE_SAMPLE_N 256
-#define CALIBRATE_TICK_DELAY 10
 
 /**
  * Sum multiple samples of ADC data spaced evenly by a delay
  */
 float read_samples(int size, uint32_t tick_delay) {
-	uint32_t total = 0;
-	for (int i = 0; i < size; i++) {
-		total += read_temp_raw();
-		HAL_Delay(tick_delay);
-	}
-	return total*1.0/size;
+  uint32_t total = 0;
+  for (int i = 0; i < size; i++) {
+    total += read_temp_raw();
+    HAL_Delay(tick_delay);
+  }
+  return total * 1.0 / size;
 }
-
-/**
- * Convert raw ADC readings to temperature (Celcius)
- * Correct for lower readings when heater is on
- */
-#define RAW_TO_TEMP(raw) ((RAW_TO_TEMP_A*((raw) - heater_set_val*HEATER_ADC_DIFF) + RAW_TO_TEMP_B))
 
 /**
  * For calibrating raw temperature readings to real temperature.
  */
 void calibrate_temperature() {
-	// ensure that we are in calibration mode
-	mode = 0;
+  // disable heater
+  set_heater(0);
+  UART_PRINTF("%d\n", sizeof(int));
 
-	// disable heater
-	set_heater(0);
-	UART_PRINTF("%d\n", sizeof(int));
+  while (1) {
+    float reading = read_samples(256, 10);
 
-	while (1) {
-		float reading = read_samples(CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY);
+    UART_PRINTF("Raw reading averaged over 256 samples every 10 ms: ");
+    UART_PRINT_FLOAT(reading);
+    UART_PRINTF(", converted temp (F): ");
+    UART_PRINT_FLOAT(RAW_TO_TEMP(reading));
+    UART_PRINTF("\n\r");
 
-		UART_PRINTF("Raw reading averaged over %d samples every %d ms: ", CALIBRATE_SAMPLE_N, CALIBRATE_TICK_DELAY);
-		UART_PRINT_FLOAT(reading);
-		UART_PRINTF("\n\r");
-
-		HAL_Delay(500);
-	}
+    HAL_Delay(500);
+  }
 }
 
 /**
@@ -161,61 +169,109 @@ void calibrate_temperature() {
  * cut -d' ' -f 6,9 | sort | awk -F' ' '{vals[$1]+=$2;vsq[$1]+=($2)^2;c[$1]+=1;} END{for (v in vals) print v, vals[v]/c[v], sqrt((vsq[v]-vals[v]^2/c[v])/c[v]);}'
  */
 void calibrate_voltage_drop() {
-	float heatval = 0;
+  float heatval = 0;
 
-	// ensure that we are in calibration mode
-	mode = 0;
+  // disable heater
+  set_heater(0);
 
-	// disable heater
-	set_heater(0);
+  while (1) {
+    // calculate baseline
+    set_heater(0);
+    float baseline = read_samples(256, 10);
 
-	while (1) {
-		// calculate baseline
-		set_heater(0);
-		float baseline = read_samples(256, 10);
+    // measure spike with heater
+    set_heater(heatval);
+    float with_heater = read_samples(16, 2);
+    set_heater(0);
 
-		// measure spike with heater
-		set_heater(heatval);
-		float with_heater = read_samples(16, 2);
-		set_heater(0);
+    UART_PRINTF("baseline: ");
+    UART_PRINT_FLOAT(baseline);
+    UART_PRINTF(", with heater at ");
+    UART_PRINT_FLOAT(heatval);
+    UART_PRINTF(": ");
+    UART_PRINT_FLOAT(with_heater);
+    UART_PRINTF(", delta: ");
+    UART_PRINT_FLOAT(baseline - with_heater);
+    UART_PRINTF("\n\r");
 
-		UART_PRINTF("baseline: ");
-		UART_PRINT_FLOAT(baseline);
-		UART_PRINTF(", with heater at ");
-		UART_PRINT_FLOAT(heatval);
-		UART_PRINTF(": ");
-		UART_PRINT_FLOAT(with_heater);
-		UART_PRINTF(", delta: ");
-		UART_PRINT_FLOAT(baseline - with_heater);
-		UART_PRINTF("\n\r");
+    heatval += 0.25;
+    if (heatval > 1.0)
+      heatval = 0;
 
-		heatval += 0.25;
-		if (heatval > 1.0) heatval = 0;
-
-		HAL_Delay(500);
-	}
+    HAL_Delay(500);
+  }
 }
 
-static int global_counter = 0;
+void PID_init() {
+  memset(&pidctl, 0, sizeof(pidctl));
+  PID(&pidctl.TPID, &pidctl.input, &pidctl.output, &pidctl.sp, 2, 5, 1, _PID_P_ON_M, _PID_CD_DIRECT);
+  PID_SetMode(&pidctl.TPID, _PID_MODE_AUTOMATIC);
+  PID_SetSampleTime(&pidctl.TPID, 10);
+  PID_SetOutputLimits(&pidctl.TPID, 0, 1);
+}
+
+void PID_update() {
+  pidctl.input = RAW_TO_TEMP(read_temp_raw());
+  PID_Compute(&pidctl.TPID);
+  set_heater(pidctl.output);
+
+  // update history for debugging
+  temp_history[current_history] = pidctl.input;
+  output_history[current_history] = pidctl.output;
+  current_history = (current_history + 1) % HIST_SIZE;
+}
+
+void PID_new_sp(double new_sp) {
+  pidctl.sp = new_sp;
+}
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-	if (htim->Instance == TIM16) {
-		// used for PID, interrupts every 10ms
-		global_counter++;
-	}
+  if (htim->Instance == TIM16) {
+    // used for PID, interrupts every 10ms
+    PID_update();
+  }
+}
+
+/**
+ * Creates new row of temperature (and control) graph
+ */
+void graph_temp() {
+  float avg_i = 0, avg_o = 0;
+  for (int i = 0; i < HIST_SIZE; i++) {
+    avg_i += temp_history[i];
+    avg_o += output_history[i];
+  }
+  avg_i /= HIST_SIZE;
+  avg_o /= HIST_SIZE;
+
+  int temp_col = (avg_i-GRAPH_TEMP_MIN)/GRAPH_TEMP_RANGE * GRAPH_N_CHARS;
+  int out_col = avg_o * GRAPH_N_CHARS;
+  int sp_col = (pidctl.sp-GRAPH_TEMP_MIN)/GRAPH_TEMP_RANGE * GRAPH_N_CHARS;
+  temp_col = CLAMP(temp_col, 0, GRAPH_N_CHARS-1);
+  out_col = CLAMP(out_col, 0, GRAPH_N_CHARS-1);
+  sp_col = CLAMP(sp_col, 0, GRAPH_N_CHARS-1);
+
+  char data[GRAPH_N_CHARS+2];
+  memset(data, ' ', sizeof(data));
+  data[0] = '|';
+  data[GRAPH_N_CHARS-1] = '|';
+  data[out_col] = '.';
+  data[sp_col] = '+';
+  data[temp_col] = '#';
+  data[GRAPH_N_CHARS] = '\n';
+  data[GRAPH_N_CHARS+1] = 0;
+  UART_PRINTF(data);
 }
 
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
   /* USER CODE BEGIN 1 */
-	mode = 0;
-	set_heater(0);
+  set_heater(0);
 
   /* USER CODE END 1 */
 
@@ -243,43 +299,76 @@ int main(void)
   MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
 
-	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-	// start in interrupt mode to drive PID control
-	HAL_TIM_Base_Start_IT(&htim16);
-	UART_PRINTF("Boot.\n\r");
+  // start PWM for heater control
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+
+  // PID control
+  PID_init();
+
+  // reset heater again just to be sure
+  set_heater(0);
+
+  UART_PRINTF("Boot.\n\r");
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-	// select function to run
-//	calibrate_temperature();
-//	calibrate_voltage_drop();
+  /* only run one of the below functions */
 
-	while (1) {
-		UART_PRINTF("Ctr: %7d\n\r", global_counter);
-		HAL_Delay(1000);
+//  calibrate_temperature();
+//  calibrate_voltage_drop();
+  HAL_TIM_Base_Start_IT(&htim16); // start pid timer interrups
+
+
+  while (1) {
+    int seconds = HAL_GetTick()/1000;
+
+//    float avg_i = 0, avg_o = 0;
+//    for (int i = 0; i < HIST_SIZE; i++) {
+//      avg_i += temp_history[i];
+//      avg_o += output_history[i];
+//    }
+//    avg_i /= HIST_SIZE;
+//    avg_o /= HIST_SIZE;
+//    UART_PRINTF("at second %2d, temp: ", seconds);
+//    UART_PRINT_FLOAT(avg_i);
+//    UART_PRINTF(", heater control: ");
+//    UART_PRINT_FLOAT(avg_o);
+//    UART_PRINTF(", set point: ");
+//    UART_PRINT_FLOAT(pidctl.sp);
+//    UART_PRINTF("\n");
+
+    graph_temp();
+
+    if ((seconds/10)%2 == 0) {
+      PID_new_sp(75);
+    } else {
+      PID_new_sp(73);
+    }
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	}
+    HAL_Delay(500);
+  }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
+  RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
 
   /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSI14;
+   * in the RCC_OscInitTypeDef structure.
+   */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI
+      | RCC_OSCILLATORTYPE_HSI14;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSI14State = RCC_HSI14_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -288,45 +377,42 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL6;
   RCC_OscInitStruct.PLL.PREDIV = RCC_PREDIV_DIV1;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1;
+   */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+      | RCC_CLOCKTYPE_PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
-  {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK) {
     Error_Handler();
   }
 }
 
 /**
-  * @brief ADC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_ADC_Init(void)
-{
+ * @brief ADC Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_ADC_Init(void) {
 
   /* USER CODE BEGIN ADC_Init 0 */
 
   /* USER CODE END ADC_Init 0 */
 
-  ADC_ChannelConfTypeDef sConfig = {0};
+  ADC_ChannelConfTypeDef sConfig = { 0 };
 
   /* USER CODE BEGIN ADC_Init 1 */
 
   /* USER CODE END ADC_Init 1 */
 
   /** Configure the global features of the ADC (Clock, Resolution, Data Alignment and number of conversion)
-  */
+   */
   hadc.Instance = ADC1;
   hadc.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV1;
   hadc.Init.Resolution = ADC_RESOLUTION_12B;
@@ -341,18 +427,16 @@ static void MX_ADC_Init(void)
   hadc.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc.Init.DMAContinuousRequests = DISABLE;
   hadc.Init.Overrun = ADC_OVR_DATA_PRESERVED;
-  if (HAL_ADC_Init(&hadc) != HAL_OK)
-  {
+  if (HAL_ADC_Init(&hadc) != HAL_OK) {
     Error_Handler();
   }
 
   /** Configure for the selected ADC regular channel to be converted.
-  */
+   */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = ADC_RANK_CHANNEL_NUMBER;
   sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
-  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK)
-  {
+  if (HAL_ADC_ConfigChannel(&hadc, &sConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN ADC_Init 2 */
@@ -362,21 +446,20 @@ static void MX_ADC_Init(void)
 }
 
 /**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
+ * @brief TIM1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM1_Init(void) {
 
   /* USER CODE BEGIN TIM1_Init 0 */
 
   /* USER CODE END TIM1_Init 0 */
 
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+  TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+  TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+  TIM_OC_InitTypeDef sConfigOC = { 0 };
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = { 0 };
 
   /* USER CODE BEGIN TIM1_Init 1 */
 
@@ -388,23 +471,19 @@ static void MX_TIM1_Init(void)
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-  if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
-  {
+  if (HAL_TIM_Base_Init(&htim1) != HAL_OK) {
     Error_Handler();
   }
   sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK)
-  {
+  if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) {
     Error_Handler();
   }
-  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-  {
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) {
     Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK) {
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
@@ -414,8 +493,7 @@ static void MX_TIM1_Init(void)
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) {
     Error_Handler();
   }
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
@@ -425,8 +503,7 @@ static void MX_TIM1_Init(void)
   sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
   sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
   sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
-  {
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
@@ -437,12 +514,11 @@ static void MX_TIM1_Init(void)
 }
 
 /**
-  * @brief TIM16 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM16_Init(void)
-{
+ * @brief TIM16 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM16_Init(void) {
 
   /* USER CODE BEGIN TIM16_Init 0 */
 
@@ -452,14 +528,13 @@ static void MX_TIM16_Init(void)
 
   /* USER CODE END TIM16_Init 1 */
   htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 48-1;
+  htim16.Init.Prescaler = 48 - 1;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim16.Init.Period = 10000-1;
+  htim16.Init.Period = 10000 - 1;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim16.Init.RepetitionCounter = 0;
   htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
-  {
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN TIM16_Init 2 */
@@ -469,12 +544,11 @@ static void MX_TIM16_Init(void)
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
+ * @brief USART2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART2_UART_Init(void) {
 
   /* USER CODE BEGIN USART2_Init 0 */
 
@@ -493,8 +567,7 @@ static void MX_USART2_UART_Init(void)
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
+  if (HAL_UART_Init(&huart2) != HAL_OK) {
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
@@ -504,15 +577,14 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
+  GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -535,8 +607,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -544,16 +616,15 @@ static void MX_GPIO_Init(void)
 /* USER CODE END 4 */
 
 /**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
   /* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
-	__disable_irq();
-	while (1) {
-	}
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1) {
+  }
   /* USER CODE END Error_Handler_Debug */
 }
 
