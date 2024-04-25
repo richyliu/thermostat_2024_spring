@@ -40,16 +40,25 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // when the heater is on (pwm set to 0), the ADC reading is on average different by this much than what it should be
-#define HEATER_ADC_DIFF -14.6
-#define RAW_TO_TEMP_A 0.123
-#define RAW_TO_TEMP_B -365.9
+#define HEATER_ADC_DIFF 0
+// raw temp value (from 0 to 4096) is converted to temperature (Fahrenheit) using the equation:
+// Ax + B
+// where x is the raw temp value and A and B are constants defined below
+#define RAW_TO_TEMP_A 0.2
+#define RAW_TO_TEMP_B -38.5
+
+#define SP_HIGH 97.0
+#define SP_LOW 93.0
+#define SP_INIT 95.0
 
 #define _UART_BUF_SIZE 256
 #define HIST_SIZE 128
 
+//#define MANUAL_MODE
+
 // settings for debug graph
 #define GRAPH_N_CHARS 64
-#define GRAPH_TEMP_MIN 80
+#define GRAPH_TEMP_MIN 90
 #define GRAPH_TEMP_RANGE 10.0
 /* USER CODE END PD */
 
@@ -137,7 +146,7 @@ void set_heater(float value) {
    * This is because heater is connected active low
    */
   heater_set_val = value;
-  TIM1->CCR1 = fabs(1.0 - value) * 0xffff;
+  TIM1->CCR1 = fabs(value) * 0xffff;
 }
 
 /**
@@ -214,7 +223,7 @@ void calibrate_voltage_drop() {
 
 void PID_init() {
   memset(&pidctl, 0, sizeof(pidctl));
-  PID(&pidctl.TPID, &pidctl.input, &pidctl.output, &pidctl.sp, 2.0, 100.0, 0, _PID_P_ON_M, _PID_CD_DIRECT);
+  PID(&pidctl.TPID, &pidctl.input, &pidctl.output, &pidctl.sp, 2.0, 1000.0, 0, _PID_P_ON_M, _PID_CD_DIRECT);
   PID_SetMode(&pidctl.TPID, _PID_MODE_AUTOMATIC);
   PID_SetSampleTime(&pidctl.TPID, 10);
   PID_SetOutputLimits(&pidctl.TPID, 0, 1);
@@ -223,7 +232,11 @@ void PID_init() {
 void PID_update() {
   pidctl.input = RAW_TO_TEMP(read_temp_raw());
   PID_Compute(&pidctl.TPID);
+#ifdef MANUAL_MODE
+  set_heater(pidctl.sp < SP_INIT);
+#else
   set_heater(pidctl.output);
+#endif
 
   // update history for debugging
   temp_history[current_history] = pidctl.input;
@@ -236,10 +249,10 @@ void PID_new_sp(double new_sp) {
 }
 
 void button_released() {
-  if (pidctl.sp < 85)
-    PID_new_sp(87.0);
+  if (pidctl.sp < SP_INIT)
+    PID_new_sp(SP_HIGH);
   else
-    PID_new_sp(83.0);
+    PID_new_sp(SP_LOW);
 }
 
 /**
@@ -370,7 +383,7 @@ int main(void)
 //  calibrate_voltage_drop();
   HAL_TIM_Base_Start_IT(&htim16); // start pid timer interrups
 
-  PID_new_sp(85.0);
+  PID_new_sp(SP_INIT);
 
   while (1) {
     /* USER CODE END WHILE */
