@@ -52,7 +52,7 @@ typedef struct {
 #define SP_INIT 95.0
 
 #define _UART_BUF_SIZE 256
-#define HIST_SIZE 128
+#define HIST_SIZE 4
 
 //#define MANUAL_MODE
 
@@ -140,10 +140,10 @@ uint16_t read_temp_raw() {
 void set_heater(float value) {
   /*
    * Note:
-   * raw value = 0: heater on 100%
-   * raw value = 65535 (max): heater off 0%
+   * raw value = 0: heater off 0%
+   * raw value = 65535 (max): heater on 100%
    *
-   * This is because heater is connected active low
+   * New version of hardware model is active high
    */
   heater_set_val = value;
   TIM1->CCR1 = fabs(value) * 0xffff;
@@ -225,7 +225,7 @@ void PID_init() {
   memset(&pidctl, 0, sizeof(pidctl));
   PID(&pidctl.TPID, &pidctl.input, &pidctl.output, &pidctl.sp, 2.0, 1000.0, 0, _PID_P_ON_M, _PID_CD_DIRECT);
   PID_SetMode(&pidctl.TPID, _PID_MODE_AUTOMATIC);
-  PID_SetSampleTime(&pidctl.TPID, 10);
+  PID_SetSampleTime(&pidctl.TPID, 80);
   PID_SetOutputLimits(&pidctl.TPID, 0, 1);
 }
 
@@ -259,7 +259,9 @@ void button_released() {
  * Creates new row of temperature (and control) graph
  */
 void graph_temp() {
-  int seconds = HAL_GetTick()/1000;
+  int tick = HAL_GetTick();
+  int seconds = tick/1000;
+  int ms = tick % 1000;
 
   float avg_i = 0, avg_o = 0;
   for (int i = 0; i < HIST_SIZE; i++) {
@@ -293,11 +295,11 @@ void graph_temp() {
   UART_PRINT_FLOAT(avg_o);
   UART_PRINTF(", sp: ");
   UART_PRINT_FLOAT(pidctl.sp);
-  UART_PRINTF(", raw: %4d, time: %3d sec\n", read_temp_raw(), seconds);
+  UART_PRINTF(", raw: %4d, time: %3d.%03d sec\n", read_temp_raw(), seconds, ms);
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  static uint8_t ctr = 0;
+  static int ctr = 0;
 
   if (htim->Instance == TIM16) {
     // interrupts every 10ms
@@ -318,7 +320,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 
     ctr++;
     // debug graph
-    if (ctr % 50 == 0) {
+    if (ctr % HIST_SIZE == 0) {
       graph_temp();
     }
   }
@@ -332,6 +334,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
   set_heater(0);
 
@@ -425,7 +428,7 @@ void SystemClock_Config(void)
                               |RCC_CLOCKTYPE_PCLK1;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV16;
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
@@ -578,7 +581,7 @@ static void MX_TIM16_Init(void)
 
   /* USER CODE END TIM16_Init 1 */
   htim16.Instance = TIM16;
-  htim16.Init.Prescaler = 48-1;
+  htim16.Init.Prescaler = 51-1;
   htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim16.Init.Period = 10000-1;
   htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
