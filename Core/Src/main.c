@@ -42,8 +42,8 @@ typedef struct {
 // raw temp value (from 0 to 4096) is converted to temperature (Fahrenheit) using the equation:
 // Ax + B
 // where x is the raw temp value and A and B are constants defined below
-#define RAW_TO_TEMP_A 0.2
-#define RAW_TO_TEMP_B -38.5
+#define RAW_TO_TEMP_A 0.15
+#define RAW_TO_TEMP_B -8.6
 
 #define SP_HIGH 97.0
 #define SP_LOW 93.0
@@ -289,10 +289,8 @@ void graph_temp() {
   avg_o /= HIST_SIZE;
 
   int temp_col = (avg_i-GRAPH_TEMP_MIN)/GRAPH_TEMP_RANGE * GRAPH_N_CHARS;
-  int out_col = avg_o * GRAPH_N_CHARS;
   int sp_col = (pidctl.sp-GRAPH_TEMP_MIN)/GRAPH_TEMP_RANGE * GRAPH_N_CHARS;
   temp_col = CLAMP(temp_col, 0, GRAPH_N_CHARS-1);
-  out_col = CLAMP(out_col, 0, GRAPH_N_CHARS-1);
   sp_col = CLAMP(sp_col, 0, GRAPH_N_CHARS-1);
 
   char data[GRAPH_N_CHARS+2];
@@ -300,7 +298,6 @@ void graph_temp() {
   data[0] = '|';
   data[GRAPH_N_CHARS-1] = '|';
   data[sp_col] = '.';
-  data[out_col] = '+';
   data[temp_col] = '#';
   data[GRAPH_N_CHARS] = 0;
   data[GRAPH_N_CHARS+1] = 0;
@@ -312,7 +309,7 @@ void graph_temp() {
   UART_PRINT_FLOAT(avg_o);
   UART_PRINTF(" sp=");
   UART_PRINT_FLOAT(pidctl.sp);
-  UART_PRINTF(" avg_raw=%3d en=%1d time=%3d.%03d\n", TEMP_TO_RAW(avg_i), pidctl_en, seconds, ms);
+  UART_PRINTF(" avg_raw=%3d en=%1d time=%2d.%03d\n", TEMP_TO_RAW(avg_i), pidctl_en, seconds, ms);
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
