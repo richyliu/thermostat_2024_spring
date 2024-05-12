@@ -39,8 +39,6 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// when the heater is on (pwm set to 0), the ADC reading is on average different by this much than what it should be
-#define HEATER_ADC_DIFF 0
 // raw temp value (from 0 to 4096) is converted to temperature (Fahrenheit) using the equation:
 // Ax + B
 // where x is the raw temp value and A and B are constants defined below
@@ -82,9 +80,9 @@ typedef struct {
 
 /**
  * Convert raw ADC readings to temperature (Fahrenheit)
- * Corrects for lower readings when heater is on
  */
-#define RAW_TO_TEMP(raw) ((RAW_TO_TEMP_A*((raw) - heater_set_val*HEATER_ADC_DIFF) + RAW_TO_TEMP_B))
+#define RAW_TO_TEMP(raw) (((RAW_TO_TEMP_A)*(float)(raw) + (RAW_TO_TEMP_B)))
+#define TEMP_TO_RAW(temp) ((uint16_t)(((temp) - (RAW_TO_TEMP_B))/(RAW_TO_TEMP_A)))
 
 #define CLAMP(v, min, max) ((v) < (min) ? (min) : (v) > (max) ? (max) : (v))
 /* USER CODE END PM */
@@ -104,6 +102,10 @@ char _uart_buf[_UART_BUF_SIZE];
 float heater_set_val;
 
 PID_control pidctl;
+int pidctl_en = 0;
+
+// button alternates between heater states (on/off, which SP)
+int button_state = 0;
 
 float temp_history[HIST_SIZE];
 float output_history[HIST_SIZE];
@@ -235,6 +237,9 @@ void PID_update() {
 #ifdef MANUAL_MODE
   set_heater(pidctl.sp < SP_INIT);
 #else
+  if (!pidctl_en) {
+    pidctl.output = 0;
+  }
   set_heater(pidctl.output);
 #endif
 
@@ -249,10 +254,22 @@ void PID_new_sp(double new_sp) {
 }
 
 void button_released() {
-  if (pidctl.sp < SP_INIT)
-    PID_new_sp(SP_HIGH);
-  else
+  button_state = (button_state + 1) % 4;
+
+  // 0 state: off
+  // 1 state: mid sp
+  // 2 state: low sp
+  // 3 state: high sp
+
+  pidctl_en = button_state != 0;
+
+  if (button_state == 1) {
+    PID_new_sp(SP_INIT);
+  } else if (button_state == 2) {
     PID_new_sp(SP_LOW);
+  } else if (button_state == 3) {
+    PID_new_sp(SP_HIGH);
+  }
 }
 
 /**
@@ -289,28 +306,27 @@ void graph_temp() {
   data[GRAPH_N_CHARS+1] = 0;
   UART_PRINTF(data);
 
-  UART_PRINTF(" temp: ");
+  UART_PRINTF(" temp=");
   UART_PRINT_FLOAT(avg_i);
-  UART_PRINTF(", control: ");
+  UART_PRINTF(" ctl=");
   UART_PRINT_FLOAT(avg_o);
-  UART_PRINTF(", sp: ");
+  UART_PRINTF(" sp=");
   UART_PRINT_FLOAT(pidctl.sp);
-  UART_PRINTF(", raw: %4d, time: %3d.%03d sec\n", read_temp_raw(), seconds, ms);
+  UART_PRINTF(" avg_raw=%3d en=%1d time=%3d.%03d\n", TEMP_TO_RAW(avg_i), pidctl_en, seconds, ms);
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   static int ctr = 0;
 
   if (htim->Instance == TIM16) {
-    // interrupts every 10ms
     PID_update();
 
     // button debouncing
     int pressed = HAL_GPIO_ReadPin(blue_btn_GPIO_Port, blue_btn_Pin) == GPIO_PIN_RESET;
     button_debounce = (button_debounce << 1) | (pressed & 1);
-    if (button_debounce == 0xff) {
+    if ((button_debounce & 1) == 1) {
       button_on = 1;
-    } else if (button_debounce == 0x00) {
+    } else if ((button_debounce & 1) == 0) {
       if (button_on) {
         // button release (falling edge)
         button_released();
