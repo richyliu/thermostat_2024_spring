@@ -42,8 +42,8 @@ typedef struct {
 // raw temp value (from 0 to 4096) is converted to temperature (Fahrenheit) using the equation:
 // Ax + B
 // where x is the raw temp value and A and B are constants defined below
-#define RAW_TO_TEMP_A 0.15
-#define RAW_TO_TEMP_B -8.6
+#define RAW_TO_TEMP_A 0.175
+#define RAW_TO_TEMP_B -22.2
 
 #define SP_HIGH 97.0
 #define SP_LOW 93.0
